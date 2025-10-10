@@ -29,6 +29,8 @@
 #include <string.h>
 #include <stdio.h>
 #include "dma.h"
+#include "ringbuffer.h"
+#incl
 
 /* 外部变量声明 */
 extern DMA_HandleTypeDef hdma_usart3_rx;
@@ -54,6 +56,11 @@ extern DMA_HandleTypeDef hdma_usart3_rx;
 // DMA接收相关变量
 #define DMA_RX_BUF_SIZE 128
 uint8_t dma_rx_buf[DMA_RX_BUF_SIZE];  // DMA接收缓冲区
+
+// 环形缓冲区相关变量
+#define RING_BUFFER_SIZE 512
+uint8_t ring_buffer_pool[RING_BUFFER_SIZE];     // 环形缓冲区内存池
+struct rt_ringbuffer uart_rx_ringbuf;          // 环形缓冲区对象
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -77,7 +84,7 @@ const osMessageQueueAttr_t Uart_Queue_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-
+void process_uart_data(uint8_t* data, int length);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -92,6 +99,9 @@ void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
+  // 初始化环形缓冲区
+  rt_ringbuffer_init(&uart_rx_ringbuf, ring_buffer_pool, RING_BUFFER_SIZE);
+  
   // 启动DMA + Idle中断接收
   HAL_UARTEx_ReceiveToIdle_DMA(&huart3, dma_rx_buf, DMA_RX_BUF_SIZE);
   
@@ -165,17 +175,27 @@ void startUART_task(void *argument)
 {
   /* USER CODE BEGIN startUART_task */
   /* 发送欢迎信息 */
-  char welcome[] = "=== DMA + Idle UART ===\r\nType something and press Enter:\r\n";
+  char welcome[] = "=== Simple UART Echo ===\r\nType something:\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)welcome, strlen(welcome), 1000);
+  
+  uint8_t rx_buffer[256];
+  int bytes_read;  // 改为int类型，更简单
   
   /* Infinite loop */
   for(;;)
   {
-    /* 任务主要工作在中断回调中完成，这里只需要延时 */
-    osDelay(1000);
+    /* 检查是否有数据 */
+    if (rt_ringbuffer_data_len(&uart_rx_ringbuf) > 0) {
+      /* 读取数据 */
+      bytes_read = rt_ringbuffer_get(&uart_rx_ringbuf, rx_buffer, sizeof(rx_buffer) - 1);
+      
+      if (bytes_read > 0) {
+        rx_buffer[bytes_read] = '\0';
+        process_uart_data(rx_buffer, bytes_read);
+      }
+    }
     
-    /* 可选：发送心跳信息（证明任务在运行） */
-    // HAL_UART_Transmit(&huart3, (uint8_t*)".", 1, 100);
+    osDelay(50);  // 增加延时，降低CPU占用
   }
   /* USER CODE END startUART_task */
 }
@@ -192,18 +212,19 @@ void startUART_task(void *argument)
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   if (huart->Instance == USART3) {
-    /* 添加字符串结束符 */
+    /* 方案A：继续使用环形缓冲区（推荐） */
+    rt_size_t written = rt_ringbuffer_put(&uart_rx_ringbuf, dma_rx_buf, Size);
+    if (written < Size) {
+      char warning[] = "\r\n[WARNING] Ring buffer overflow!\r\n";
+      HAL_UART_Transmit(&huart3, (uint8_t*)warning, strlen(warning), 100);
+    }
+    
+    /* 方案B：最简单 - 直接在中断中回显（取消下面注释即可使用）
     dma_rx_buf[Size] = '\0';
-    
-    /* 发送接收到的数据信息 */
-    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\nReceived: ", 12, 100);
+    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\nEcho: ", 8, 100);
     HAL_UART_Transmit(&huart3, dma_rx_buf, Size, 100);
-    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\nLength: ", 10, 100);
-    
-    /* 发送长度信息 */
-    char length_str[10];
-    sprintf(length_str, "%d\r\n\r\n", Size);
-    HAL_UART_Transmit(&huart3, (uint8_t*)length_str, strlen(length_str), 100);
+    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, 100);
+    */
     
     /* 重新启动DMA接收 */
     HAL_UARTEx_ReceiveToIdle_DMA(&huart3, dma_rx_buf, DMA_RX_BUF_SIZE);
@@ -223,6 +244,20 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
     HAL_UARTEx_ReceiveToIdle_DMA(&huart3, dma_rx_buf, DMA_RX_BUF_SIZE);
     __HAL_DMA_DISABLE_IT(&hdma_usart3_rx, DMA_IT_HT);
   }
+}
+
+/**
+ * @brief 处理UART接收到的数据 - 超简化版本
+ * @param data: 接收到的数据
+ * @param length: 数据长度
+ * @retval None
+ */
+void process_uart_data(uint8_t* data, int length)
+{
+  /* 最简单的回显：发送什么，返回什么 */
+  HAL_UART_Transmit(&huart3, (uint8_t*)"Echo: ", 6, 100);
+  HAL_UART_Transmit(&huart3, data, length, 100);
+  HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, 100);
 }
 
 /* USER CODE END Application */
