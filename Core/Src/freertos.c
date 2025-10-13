@@ -30,7 +30,6 @@
 #include <stdio.h>
 #include "dma.h"
 #include "ringbuffer.h"
-#incl
 
 /* 外部变量声明 */
 extern DMA_HandleTypeDef hdma_usart3_rx;
