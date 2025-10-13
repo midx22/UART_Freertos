@@ -29,7 +29,7 @@
 #include <string.h>
 #include <stdio.h>
 #include "dma.h"
-#include "ringbuffer.h"
+#include "stream_buffer.h"
 
 /* 外部变量声明 */
 extern DMA_HandleTypeDef hdma_usart3_rx;
@@ -56,10 +56,10 @@ extern DMA_HandleTypeDef hdma_usart3_rx;
 #define DMA_RX_BUF_SIZE 128
 uint8_t dma_rx_buf[DMA_RX_BUF_SIZE];  // DMA接收缓冲区
 
-// 环形缓冲区相关变量
-#define RING_BUFFER_SIZE 512
-uint8_t ring_buffer_pool[RING_BUFFER_SIZE];     // 环形缓冲区内存池
-struct rt_ringbuffer uart_rx_ringbuf;          // 环形缓冲区对象
+// 流缓冲区相关变量
+#define STREAM_BUFFER_SIZE 512
+#define STREAM_TRIGGER_LEVEL 1          // 触发级别：收到1个字节就唤醒任务
+StreamBufferHandle_t uart_stream_buffer;       // 流缓冲区句柄
 /* USER CODE END Variables */
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
@@ -72,7 +72,7 @@ const osThreadAttr_t defaultTask_attributes = {
 osThreadId_t UART_taskHandle;
 const osThreadAttr_t UART_task_attributes = {
   .name = "UART_task",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityLow,
 };
 /* Definitions for Uart_Queue */
@@ -83,7 +83,8 @@ const osMessageQueueAttr_t Uart_Queue_attributes = {
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
-void process_uart_data(uint8_t* data, int length);
+void process_uart_data(uint8_t* data, size_t length);
+void check_task_stack_usage(void);
 /* USER CODE END FunctionPrototypes */
 
 void StartDefaultTask(void *argument);
@@ -98,8 +99,17 @@ void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
   */
 void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN Init */
-  // 初始化环形缓冲区
-  rt_ringbuffer_init(&uart_rx_ringbuf, ring_buffer_pool, RING_BUFFER_SIZE);
+  // 检查初始堆内存
+  uint32_t free_heap_before = xPortGetFreeHeapSize();
+  
+  // 创建流缓冲区
+  uart_stream_buffer = xStreamBufferCreate(STREAM_BUFFER_SIZE, STREAM_TRIGGER_LEVEL);
+  
+  // 检查流缓冲区是否创建成功
+  if (uart_stream_buffer == NULL) {
+    // 流缓冲区创建失败 - 可能内存不足
+    Error_Handler();
+  }
   
   // 启动DMA + Idle中断接收
   HAL_UARTEx_ReceiveToIdle_DMA(&huart3, dma_rx_buf, DMA_RX_BUF_SIZE);
@@ -174,28 +184,31 @@ void startUART_task(void *argument)
 {
   /* USER CODE BEGIN startUART_task */
   /* 发送欢迎信息 */
-  char welcome[] = "=== Simple UART Echo ===\r\nType something:\r\n";
+  char welcome[] = "=== Simple Stream Buffer Echo ===\r\n"
+                   "Commands:\r\n"
+                   "  'stack' - Show task stack usage\r\n"
+                   "  Other text will be echoed\r\n"
+                   "Type something:\r\n";
   HAL_UART_Transmit(&huart3, (uint8_t*)welcome, strlen(welcome), 1000);
   
-  uint8_t rx_buffer[256];
-  int bytes_read;  // 改为int类型，更简单
+  uint8_t rx_buffer[128];
+  size_t bytes_read;
   
   /* Infinite loop */
   for(;;)
   {
-    /* 检查是否有数据 */
-    if (rt_ringbuffer_data_len(&uart_rx_ringbuf) > 0) {
-      /* 读取数据 */
-      bytes_read = rt_ringbuffer_get(&uart_rx_ringbuf, rx_buffer, sizeof(rx_buffer) - 1);
-      
-      if (bytes_read > 0) {
-        rx_buffer[bytes_read] = '\0';
-        process_uart_data(rx_buffer, bytes_read);
-      }
-    }
+    /* 从流缓冲区接收数据 - 阻塞等待 */
+    bytes_read = xStreamBufferReceive(uart_stream_buffer, 
+                                    rx_buffer, 
+                                    sizeof(rx_buffer) - 1, 
+                                    portMAX_DELAY);
     
-    osDelay(50);  // 增加延时，降低CPU占用
+    if (bytes_read > 0) {
+      rx_buffer[bytes_read] = '\0';
+      process_uart_data(rx_buffer, bytes_read);
+    }
   }
+  osdelay(10);
   /* USER CODE END startUART_task */
 }
 
@@ -203,7 +216,7 @@ void startUART_task(void *argument)
 /* USER CODE BEGIN Application */
 
 /**
- * @brief UART接收事件回调函数（DMA + Idle中断）
+ * @brief UART接收事件回调函数（DMA + Idle中断）- 最简版本
  * @param huart: UART句柄
  * @param Size: 接收到的数据长度
  * @retval None
@@ -211,23 +224,20 @@ void startUART_task(void *argument)
 void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
 {
   if (huart->Instance == USART3) {
-    /* 方案A：继续使用环形缓冲区（推荐） */
-    rt_size_t written = rt_ringbuffer_put(&uart_rx_ringbuf, dma_rx_buf, Size);
-    if (written < Size) {
-      char warning[] = "\r\n[WARNING] Ring buffer overflow!\r\n";
-      HAL_UART_Transmit(&huart3, (uint8_t*)warning, strlen(warning), 100);
-    }
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     
-    /* 方案B：最简单 - 直接在中断中回显（取消下面注释即可使用）
-    dma_rx_buf[Size] = '\0';
-    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\nEcho: ", 8, 100);
-    HAL_UART_Transmit(&huart3, dma_rx_buf, Size, 100);
-    HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, 100);
-    */
+    /* 将DMA接收到的数据发送到流缓冲区 */
+    xStreamBufferSendFromISR(uart_stream_buffer, 
+                           dma_rx_buf, 
+                           Size, 
+                           &xHigherPriorityTaskWoken);
     
     /* 重新启动DMA接收 */
     HAL_UARTEx_ReceiveToIdle_DMA(&huart3, dma_rx_buf, DMA_RX_BUF_SIZE);
     __HAL_DMA_DISABLE_IT(&hdma_usart3_rx, DMA_IT_HT);
+    
+    /* 执行任务切换 */
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
   }
 }
 
@@ -246,18 +256,49 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 }
 
 /**
- * @brief 处理UART接收到的数据 - 超简化版本
+ * @brief 处理UART接收到的数据 - 最简版本
  * @param data: 接收到的数据
  * @param length: 数据长度
  * @retval None
  */
-void process_uart_data(uint8_t* data, int length)
+void process_uart_data(uint8_t* data, size_t length)
 {
-  /* 最简单的回显：发送什么，返回什么 */
+  /* 检查是否是查看栈使用情况的命令 */
+  if (strncmp((char*)data, "stack", 5) == 0) {
+    check_task_stack_usage();
+    return;
+  }
+  
+  /* 简单回显 */
   HAL_UART_Transmit(&huart3, (uint8_t*)"Echo: ", 6, 100);
   HAL_UART_Transmit(&huart3, data, length, 100);
   HAL_UART_Transmit(&huart3, (uint8_t*)"\r\n", 2, 100);
 }
+
+/**
+ * @brief 检查当前UART任务栈使用情况
+ * @retval None
+ */
+void check_task_stack_usage(void)
+{
+  /* 获取当前UART任务的栈剩余空间 */
+  UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(UART_taskHandle);
+  
+  /* 计算栈使用情况 - 使用正确的栈大小 */
+  uint32_t total_stack = 256 * 4;  // 总栈大小784字节 (与UART_task_attributes一致)
+  uint32_t used_stack = total_stack - (stack_remaining * sizeof(StackType_t));
+  uint32_t usage_percent = (used_stack * 100) / total_stack;
+  
+  /* 简单输出 */
+  char info[100];
+  int len = sprintf(info, 
+    "\r\nUART Task Stack: %lu/%lu bytes (%lu%% used)\r\n\r\n",
+    used_stack, total_stack, usage_percent);
+  
+  HAL_UART_Transmit(&huart3, (uint8_t*)info, len, 500);
+}
+
+
 
 /* USER CODE END Application */
 
